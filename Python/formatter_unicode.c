@@ -358,7 +358,8 @@ parse_internal_render_format_spec(PyObject *obj,
         }
     }
 
-    if (format->type == 'n'
+    if ((format->type == 'n' || format->type == 'd' || format->type == 'b'
+         || format->type == 'o' || format->type == 'x' || format->type == 'X')
         && format->frac_thousands_separator != LT_NO_LOCALE)
     {
         invalid_thousands_separator_type(format->frac_thousands_separator,
@@ -979,12 +980,13 @@ format_long_internal(PyObject *value, const InternalFormatSpec *format,
        from a hard-code pseudo-locale */
     LocaleInfo locale = LocaleInfo_STATIC_INIT;
 
-    /* no precision allowed on integers */
-    if (format->precision != -1) {
+    /* no precision allowed on 'c' integer representation type */
+    if (format->precision != -1 && format->type == 'c') {
         PyErr_SetString(PyExc_ValueError,
-                        "Precision not allowed in integer format specifier");
+                        "Precision not allowed with 'c' integer format specifier");
         goto done;
     }
+
     /* no negative zero coercion on integers */
     if (format->no_neg_0) {
         PyErr_SetString(PyExc_ValueError,
@@ -1063,6 +1065,7 @@ format_long_internal(PyObject *value, const InternalFormatSpec *format,
 
         if (format->sign != '+' && format->sign != ' '
             && format->width == -1
+            && format->precision == -1
             && format->type != 'X' && format->type != 'n'
             && !format->thousands_separators
             && PyLong_CheckExact(value))
@@ -1077,9 +1080,101 @@ format_long_internal(PyObject *value, const InternalFormatSpec *format,
             n_prefix = leading_chars_to_skip;
 
         /* Do the hard part, converting to a string in a given base */
-        tmp = _PyLong_Format(value, base);
-        if (tmp == NULL)
-            goto done;
+        if (format->precision != -1) {
+            /* Use two's complement for 'b', 'o' and 'x' formatting types */
+            if (format->type == 'b' || format->type == 'x'
+                || format->type == 'o' || format->type == 'X')
+            {
+                int64_t shift = Py_MAX(1, format->precision);
+
+                if (format->type == 'x' || format->type == 'X') {
+                    shift *= 4;
+                }
+                else if (format->type == 'o') {
+                    shift *= 3;
+                }
+                shift--;  /* expected value in range(-2**shift, 2**shift) */
+
+                PyObject *mod = _PyLong_Lshift(PyLong_FromLong(1), shift);
+
+                if (mod == NULL) {
+                    goto done;
+                }
+                if (PyLong_IsNegative(value)) {
+                    Py_SETREF(mod, PyNumber_Negative(mod));
+                    if (mod == NULL) {
+                        goto done;
+                    }
+                    if (PyObject_RichCompareBool(value, mod, Py_LT)) {
+                        goto range;
+                    }
+                    Py_SETREF(mod, _PyLong_Lshift(mod, 1));
+                    tmp = PyNumber_Subtract(value, mod);
+                    Py_DECREF(mod);
+                    if (tmp == NULL) {
+                        goto done;
+                    }
+                    Py_SETREF(tmp, _PyLong_Format(tmp, base));
+                }
+                else {
+                    if (PyObject_RichCompareBool(value, mod, Py_GE)) {
+range:
+                        Py_DECREF(mod);
+                        PyErr_Format(PyExc_ValueError,
+                                     "Expected integer in range(-2**%ld, 2**%ld)",
+                                     shift, shift);
+                        goto done;
+                    }
+                    Py_DECREF(mod);
+                    tmp = _PyLong_Format(value, base);
+                }
+            }
+            else {
+                tmp = _PyLong_Format(value, base);
+            }
+            if (tmp == NULL) {
+                goto done;
+            }
+
+            /* Prepend enough leading zeros (after the sign) */
+
+            int sign = PyUnicode_READ_CHAR(tmp, leading_chars_to_skip) == '-';
+            Py_ssize_t tmp2_len = format->precision + leading_chars_to_skip + sign;
+            Py_ssize_t tmp_len = PyUnicode_GET_LENGTH(tmp);
+            Py_ssize_t gap = tmp2_len - tmp_len;
+
+            if (gap > 0) {
+                PyObject *tmp2 = PyUnicode_New(tmp2_len, 127);
+
+                if (PyUnicode_CopyCharacters(tmp2, leading_chars_to_skip + gap + sign,
+                                             tmp, leading_chars_to_skip + sign,
+                                             tmp2_len - leading_chars_to_skip - sign) == -1) {
+                    Py_DECREF(tmp2);
+                    goto done;
+                }
+                if (PyUnicode_Fill(tmp2, leading_chars_to_skip + sign, gap, '0') == -1) {
+                    Py_DECREF(tmp2);
+                    goto done;
+                }
+                if (sign && PyUnicode_WriteChar(tmp2, leading_chars_to_skip, '-') == -1) {
+                    Py_DECREF(tmp2);
+                    goto done;
+                }
+                if (leading_chars_to_skip
+                    && PyUnicode_CopyCharacters(tmp2, 0, tmp, 0,
+                                                leading_chars_to_skip) == -1) {
+                    Py_DECREF(tmp2);
+                    goto done;
+                }
+                Py_SETREF(tmp, tmp2);
+            }
+        }
+        else {
+            tmp = _PyLong_Format(value, base);
+            if (tmp == NULL) {
+                goto done;
+            }
+        }
 
         inumeric_chars = 0;
         n_digits = PyUnicode_GET_LENGTH(tmp);
